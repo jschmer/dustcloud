@@ -295,7 +295,7 @@ if (isset($_GET['cmd_res']))
     $command_result_class = "";
 
     if ($command_result == $cmd_res_request_failure) {
-        $command_result_text = "Request to command server failed. Check your configuration!";
+        $command_result_text = "Request to command server (".htmlentities(CMD_SERVER).") failed. Check your configuration!";
         $command_result_class = "red";
     }
     else if ($command_result == $cmd_res_command_failure) {
