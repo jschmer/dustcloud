@@ -21,7 +21,6 @@ import binascii
 import datetime
 import struct
 import time
-import pymysql
 import select
 import ast
 import argparse
@@ -29,6 +28,12 @@ import enum
 import re
 import base64
 from miio.protocol import Message
+
+try:
+    import pymysql
+    have_pymysql = True
+except ImportError:
+    have_pymysql = False
 
 try:
     import bottle
@@ -56,6 +61,7 @@ status_methods = ['event.status', 'props', 'event.keepalive', 'event.remove', 'e
                   'event.no_motion', 'event.comfortable']
 cloud_server_address = ('ott.io.mi.com', 80)
 http_redirect_address = None
+minimal_vacuum_mode = False
 
 # dict of devices did -> [name, request_handler]
 devices = {}
@@ -140,8 +146,17 @@ class CloudClient:
     Not safe to use from multiple threads. Each thread has to use its own instance.
     """
     def __init__(self):
-        self.db = pymysql.connect("localhost", "dustcloud", "", "dustcloud")
-        self.cursor = self.db.cursor()
+        if not minimal_vacuum_mode:
+            self.db = pymysql.connect("localhost", "dustcloud", "", "dustcloud")
+            self.cursor = self.db.cursor()
+        else:
+            # check if we can read device data from filesystem
+            try:
+                ddid, dname, denckey, forward_to_cloud, full_cloud_forward = self.get_device_data(0)
+                print("Running on vacuum with did={}, name={}, enckey={}".format(ddid, dname, denckey))
+            except Exception as e:
+                print("ERROR: Failed getting device data: {}".format(e))
+                sys.exit(1)
         self.expected_messages = {}
 
     def __del__(self):
@@ -151,6 +166,9 @@ class CloudClient:
             pass
 
     def do_log(self, did, data, direction):
+        if minimal_vacuum_mode:
+            return
+
         data = "%s" % data
         try:
             self.cursor.execute("Insert into statuslog(did, data, direction) VALUES(%s, %s, %s)", (did, data, str(direction)))
@@ -161,6 +179,9 @@ class CloudClient:
             self.db.rollback()
 
     def do_log_raw(self, did, data, direction):
+        if minimal_vacuum_mode:
+            return
+
         data = "%s" % data
         try:
             self.cursor.execute("Insert into raw(did, raw, direction) VALUES(%s, %s, %s)", (did, data, str(direction)))
@@ -172,6 +193,9 @@ class CloudClient:
         return
 
     def set_last_contact(self, ddid, client_address, connmode):
+        if minimal_vacuum_mode:
+            return
+
         try:
             self.cursor.execute(
                 "UPDATE devices SET last_contact = now(), last_contact_from = %s, last_contact_via = %s WHERE did = %s",
@@ -182,6 +206,47 @@ class CloudClient:
             # Rollback in case there is any error
             print("!!! (eee) SQL rollback : %s" % str(e))
             self.db.rollback()
+
+    def get_device_data(self, did):
+        if minimal_vacuum_mode:
+            # Read data from vacuum filesystem
+            device_conf_data = open("/mnt/data/miio/device.conf", "r").read()
+
+            ddid_re = re.search('did=(.+?)\\n', device_conf_data)
+            if not ddid_re:
+                raise RuntimeError("Missing enc key in device.conf!")
+            denckey_re = re.search('key=(.+?)\\n', device_conf_data)
+            if not denckey_re:
+                raise RuntimeError("Missing did in device.conf!")
+
+            ddid = ddid_re.group(1)
+            dname = "rockrobo_dustcloud"
+            denckey = denckey_re.group(1)
+            forward_to_cloud = 0
+            full_cloud_forward = 0
+            return ddid, dname, denckey, forward_to_cloud, full_cloud_forward
+        else:
+            try:
+                if self.cursor.execute("SELECT did,name,enckey,forward_to_cloud,full_cloud_forward FROM devices WHERE did = %s", did) == 1:
+                    # Fetch all the rows in a list of lists.
+                    results = self.cursor.fetchall()
+                    if not results:
+                        print("Error: unable to fetch data for did %s. Device unknown?" % did)
+                        raise RuntimeError()
+
+                    for row in results:
+                        ddid = row[0]
+                        dname = row[1]
+                        denckey = row[2]
+                        forward_to_cloud = row[3]
+                        full_cloud_forward = row[4]
+                        return ddid, dname, denckey, forward_to_cloud, full_cloud_forward
+                else:
+                    print("Error: unable to fetch data for did %s. Device unknown?" % did)
+                    raise RuntimeError()
+            except Exception:
+                print("Error: unable to fetch data for did %s" % did)
+                raise
 
     def process_data(self, mysocket, data):
         """
@@ -216,28 +281,13 @@ class CloudClient:
                     device[1] = mysocket
 
                 try:
-                    if self.cursor.execute("SELECT did,name,enckey,forward_to_cloud,full_cloud_forward FROM devices WHERE did = %s", did) == 1:
-                        # Fetch all the rows in a list of lists.
-                        results = self.cursor.fetchall()
-                        if not results:
-                            print("Error: unable to fetch data for did %s. Device unknown?" % did)
-                            return 1
-
-                        for row in results:
-                            ddid = row[0]
-                            dname = row[1]
-                            denckey = row[2]
-                            forward_to_cloud = row[3]
-                            full_cloud_forward = row[4]
-                            # Now print fetched result
-                            print("ddid = %s, dname = %s, denckey = %s, full_cloud_forward = %d, forward_to_cloud = %d"
-                                  % (ddid, dname, denckey, forward_to_cloud, full_cloud_forward))
-                    else:
-                        print("Error: unable to fetch data for did %s. Device unknown?" % did)
-                        return 1
+                    ddid, dname, denckey, forward_to_cloud, full_cloud_forward = self.get_device_data(did)
                 except Exception:
                     print("Error: unable to fetch data for did %s" % did)
                     raise
+
+                print("ddid = %s, dname = %s, denckey = %s, full_cloud_forward = %d, forward_to_cloud = %d"
+                      % (ddid, dname, denckey, forward_to_cloud, full_cloud_forward))
 
                 enckey = denckey
                 enckey = enckey + (16 - len(enckey)) * "\x00"  # extend key if its shorter than 16 bytes
@@ -267,16 +317,17 @@ class CloudClient:
                     print("%s : Value: %s" % (dname, m.data.value))
                     if method == "_otc.info":
                         params = m.data.value["params"]
-                        try:
-                            self.cursor.execute(
-                                "UPDATE devices SET token = %s, fw = %s, mac = %s, ssid = %s, model = %s, netinfo = %s WHERE did = %s",
-                                (params["token"], params["fw_ver"], params["mac"], params["ap"]["ssid"],
-                                 params["model"], params["netif"]["localIp"], did))
-                            self.db.commit()
-                        except Exception as e:
-                            # Rollback in case there is any error
-                            print("!!! (eee) SQL rollback : %s" % str(e))
-                            self.db.rollback()
+                        if not minimal_vacuum_mode:
+                            try:
+                                self.cursor.execute(
+                                    "UPDATE devices SET token = %s, fw = %s, mac = %s, ssid = %s, model = %s, netinfo = %s WHERE did = %s",
+                                    (params["token"], params["fw_ver"], params["mac"], params["ap"]["ssid"],
+                                     params["model"], params["netif"]["localIp"], did))
+                                self.db.commit()
+                            except Exception as e:
+                                # Rollback in case there is any error
+                                print("!!! (eee) SQL rollback : %s" % str(e))
+                                self.db.rollback()
 
                         self.do_log(did, m.data.value, MessageDirection.FromClient)
                         cmd = {
@@ -399,15 +450,19 @@ class CloudClient:
         return 0
 
     def get_devices(self):
-        try:
-            if self.cursor.execute("SELECT did,name FROM devices"):
-                # Fetch all the rows in a list of lists.
-                results = self.cursor.fetchall()
-                return [[row[0], row[1]] for row in results]
-            else:
-                print("Error: device query error")
-        except Exception:
-            print("Error: unable to fetch devices")
+        if minimal_vacuum_mode:
+            ddid, dname, denckey, forward_to_cloud, full_cloud_forward = self.get_device_data(0)
+            return [[int(ddid), dname]]
+        else:
+            try:
+                if self.cursor.execute("SELECT did,name FROM devices"):
+                    # Fetch all the rows in a list of lists.
+                    results = self.cursor.fetchall()
+                    return [[row[0], row[1]] for row in results]
+                else:
+                    print("Error: device query error")
+            except Exception:
+                print("Error: unable to fetch devices")
 
         return []
 
@@ -645,7 +700,7 @@ class MyUDPHandler(socketserver.BaseRequestHandler):
 
     blocked_from_client_list = []
     blocked_from_cloud_list = []
-    Cloudi = CloudClient()
+    Cloudi = None
     Cloudi_lock = threading.Lock()
 
     def send_data_to_cloud(self, data):
@@ -672,6 +727,8 @@ class MyUDPHandler(socketserver.BaseRequestHandler):
         # keep one single instance of CloudClient for UDP connection
         # and protect it from multi-threaded access
         self.Cloudi_lock.acquire()
+        if not MyUDPHandler.Cloudi:
+            MyUDPHandler.Cloudi = CloudClient()
         self.Cloudi = MyUDPHandler.Cloudi
 
         thread_id = threading.get_ident()
@@ -756,7 +813,7 @@ def setup_command_server(enable_live_map):
     if enable_live_map:
         @http_app.post('/get_map')
         @enable_cors
-        def run_command():
+        def get_map():
             did = int(bottle.request.query.did)
             device = get_device(did)
             if device:
@@ -810,7 +867,14 @@ Acts like the cloud to let the device think it is connected properly.
         "--enable-live-map",
         required=False,
         action='store_true',
-        help="Enable live cleaning map. Needs bottle and pillow installed: 'pip install bottle pillow'")
+        help="Enable live cleaning map. Only valid when using -mode TCP. Needs bottle and pillow installed: 'pip install bottle pillow'")
+    parser.add_argument(
+        "--minimal-vacuum-mode",
+        required=False,
+        action='store_true',
+        help="Activate minimal vacuum mode for running the dustcloud proxy server on the vacuum itself. "
+             "Works without database connection so messages won't be logged to the databse and the device "
+             "configuration will be read from the vacuum automatically.")
     args = parser.parse_args()
 
     if not have_bottle:
@@ -819,9 +883,19 @@ WARNING: Won't start command server, 'bottle' package is missing! Install with '
 Dustcloud web UI won't be able to send commands.
 """)
 
-    enable_live_map = args.enable_live_map and have_build_map
+    minimal_vacuum_mode = args.minimal_vacuum_mode
+    if not minimal_vacuum_mode and not have_pymysql:
+        print("ERROR: python package 'pymysql' is missing! Install with 'pip install pymysql'.")
+        sys.exit(1)
+
+    enable_live_map = args.enable_live_map
+    if args.enable_live_map and not args.server_mode == ServerMode.TCP:
+        print("WARNING: Enabling live map feature failed, needs -mode TCP!")
+        enable_live_map = False
+
     if args.enable_live_map and not have_build_map:
         print("WARNING: Enabling live map feature failed, build_map.py is missing!")
+        enable_live_map = False
 
     http_redirect_address = args.http_redirect
     if http_redirect_address:
@@ -851,7 +925,7 @@ Dustcloud web UI won't be able to send commands.
 
         cmd_server = setup_command_server(enable_live_map)
         try:
-            cmd_server.run(host="localhost", port=cmd_server_port)
+            cmd_server.run(host="0.0.0.0", port=cmd_server_port)
         except KeyboardInterrupt:
             pass
 
